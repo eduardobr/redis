@@ -91,9 +91,12 @@ void aof_background_fsync_and_close(int fd);
 #define TEMP_FILE_NAME_PREFIX      "temp-"
 
 /* AOF manifest key. */
-#define AOF_MANIFEST_KEY_FILE_NAME   "file"
-#define AOF_MANIFEST_KEY_FILE_SEQ    "seq"
-#define AOF_MANIFEST_KEY_FILE_TYPE   "type"
+#define AOF_MANIFEST_KEY_FILE_NAME                "file"
+#define AOF_MANIFEST_KEY_FILE_SEQ                 "seq"
+#define AOF_MANIFEST_KEY_FILE_TYPE                "type"
+#define AOF_MANIFEST_KEY_REPL_LAST_INCR_FILE_SIZE "last_incr_size"
+#define AOF_MANIFEST_KEY_REPL_ID                  "replid"
+#define AOF_MANIFEST_KEY_REPL_OFFSET              "reploff"
 
 /* Create an empty aofInfo. */
 aofInfo *aofInfoCreate(void) {
@@ -105,6 +108,28 @@ void aofInfoFree(aofInfo *ai) {
     serverAssert(ai != NULL);
     if (ai->file_name) sdsfree(ai->file_name);
     zfree(ai);
+}
+
+/* Create an empty aofInfo. */
+aofReplInfo *aofReplInfoCreate(void) {
+    return zcalloc(sizeof(aofReplInfo));
+}
+
+/* Free the aofReplInfo structure (pointed to by ari) and its embedded repl_id. */
+void aofReplInfoFree(aofReplInfo *ari) {
+    serverAssert(ari != NULL);
+    if (ari->repl_id) sdsfree(ari->repl_id);
+    zfree(ari);
+}
+
+/* Deep copy an aofReplInfo. */
+aofReplInfo *aofReplInfoDup(aofReplInfo *orig) {
+    serverAssert(orig != NULL);
+    aofReplInfo *ari = aofReplInfoCreate();
+    memcpy(ari->repl_id, orig->repl_id, sizeof(ari->repl_id));
+    ari->repl_offset = orig->repl_offset;
+    ari->last_incr_size = orig->last_incr_size;
+    return ari;
 }
 
 /* Deep copy an aofInfo. */
@@ -129,6 +154,16 @@ sds aofInfoFormat(sds buf, aofInfo *ai) {
         AOF_MANIFEST_KEY_FILE_SEQ, ai->file_seq,
         AOF_MANIFEST_KEY_FILE_TYPE, ai->file_type);
     sdsfree(filename_repr);
+
+    return ret;
+}
+
+/* Format aofReplInfo as a string and it will be a line in the manifest. */
+sds aofReplInfoFormat(sds buf, aofReplInfo *ari) {
+    sds ret = sdscatprintf(buf, "# %s %lld %s %s %s %lld\n",
+        AOF_MANIFEST_KEY_REPL_LAST_INCR_FILE_SIZE, ari->last_incr_size,
+        AOF_MANIFEST_KEY_REPL_ID, ari->repl_id,
+        AOF_MANIFEST_KEY_REPL_OFFSET, ari->repl_offset);
 
     return ret;
 }
@@ -159,6 +194,7 @@ aofManifest *aofManifestCreate(void) {
 /* Free the aofManifest structure (pointed to by am) and its embedded members. */
 void aofManifestFree(aofManifest *am) {
     if (am->base_aof_info) aofInfoFree(am->base_aof_info);
+    if (am->repl_info) aofReplInfoFree(am->repl_info);
     if (am->incr_aof_list) listRelease(am->incr_aof_list);
     if (am->history_aof_list) listRelease(am->history_aof_list);
     zfree(am);
@@ -196,20 +232,25 @@ sds getAofManifestAsString(aofManifest *am) {
     listNode *ln;
     listIter li;
 
-    /* 1. Add BASE File information, it is always at the beginning
+    /* 1. Add replication information, it is always at the beginning
      * of the manifest file. */
+    if (am->repl_info) {
+        buf = aofReplInfoFormat(buf, am->repl_info);
+    }
+
+    /* 2. Add BASE File information. */
     if (am->base_aof_info) {
         buf = aofInfoFormat(buf, am->base_aof_info);
     }
 
-    /* 2. Add HISTORY type AOF information. */
+    /* 3. Add HISTORY type AOF information. */
     listRewind(am->history_aof_list, &li);
     while ((ln = listNext(&li)) != NULL) {
         aofInfo *ai = (aofInfo*)ln->value;
         buf = aofInfoFormat(buf, ai);
     }
 
-    /* 3. Add INCR type AOF information. */
+    /* 4. Add INCR type AOF information. */
     listRewind(am->incr_aof_list, &li);
     while ((ln = listNext(&li)) != NULL) {
         aofInfo *ai = (aofInfo*)ln->value;
@@ -269,6 +310,7 @@ aofManifest *aofLoadManifestFromFile(sds am_filepath) {
     sds *argv = NULL;
     int argc;
     aofInfo *ai = NULL;
+    aofReplInfo *ari = NULL;
 
     sds line = NULL;
     int linenum = 0;
@@ -290,9 +332,6 @@ aofManifest *aofLoadManifestFromFile(sds am_filepath) {
 
         linenum++;
 
-        /* Skip comments lines */
-        if (buf[0] == '#') continue;
-
         if (strchr(buf, '\n') == NULL) {
             err = "The AOF manifest file contains too long line";
             goto loaderr;
@@ -302,6 +341,41 @@ aofManifest *aofLoadManifestFromFile(sds am_filepath) {
         if (!sdslen(line)) {
             err = "Invalid AOF manifest file format";
             goto loaderr;
+        }
+
+        /* Load replication info */
+        if (buf[0] == '#') {
+            sds *repl_argv = NULL;
+            int repl_argc;
+
+            repl_argv = sdssplitargs(line, &repl_argc);
+            /* 'repl_argc < 7' was done for forward compatibility. */
+            if (repl_argv == NULL || repl_argc < 7) {
+                err = "Invalid AOF manifest file format (invalid replication info)";
+                goto loaderr;
+            }
+
+            ari = aofReplInfoCreate();
+            for (int i = 1; i < repl_argc; i += 2) {
+                if (!strcasecmp(repl_argv[i], AOF_MANIFEST_KEY_REPL_LAST_INCR_FILE_SIZE)) {
+                    ari->last_incr_size = atoll(repl_argv[i+1]);
+                } else if (!strcasecmp(repl_argv[i], AOF_MANIFEST_KEY_REPL_ID)) {
+                    memcpy(ari->repl_id,repl_argv[i+1],sizeof(ari->repl_id));
+                } else if (!strcasecmp(repl_argv[i], AOF_MANIFEST_KEY_REPL_OFFSET)) {
+                    ari->repl_offset = atoll(repl_argv[i+1]);
+                }
+            }
+
+            sdsfreesplitres(repl_argv, repl_argc);
+            repl_argv = NULL;
+
+            am->repl_info = ari;
+
+            sdsfree(line);
+            line = NULL;
+            ari = NULL;
+
+            continue;
         }
 
         argv = sdssplitargs(line, &argc);
@@ -371,6 +445,7 @@ loaderr:
      * and exit(1) without freeing these allocations. */
     if (argv) sdsfreesplitres(argv, argc);
     if (ai) aofInfoFree(ai);
+    if (ari) aofReplInfoFree(ari);
 
     serverLog(LL_WARNING, "\n*** FATAL AOF MANIFEST FILE ERROR ***\n");
     if (line) {
@@ -398,6 +473,9 @@ aofManifest *aofManifestDup(aofManifest *orig) {
 
     if (orig->base_aof_info) {
         am->base_aof_info = aofInfoDup(orig->base_aof_info);
+    }
+    if (orig->repl_info) {
+        am->repl_info = aofReplInfoDup(orig->repl_info);
     }
 
     am->incr_aof_list = listDup(orig->incr_aof_list);
@@ -596,12 +674,14 @@ cleanup:
 
 /* Persist the aofManifest information pointed to by am to disk. */
 int persistAofManifest(aofManifest *am) {
-    if (am->dirty == 0) {
-        return C_OK;
-    }
+    // if (am->dirty == 0) {
+    //     return C_OK;
+    // }
 
     sds amstr = getAofManifestAsString(am);
     int ret = writeAofManifestFile(amstr);
+    serverLog(LL_NOTICE,"Persisted manifest.");
+
     sdsfree(amstr);
     if (ret == C_OK) am->dirty = 0;
     return ret;
@@ -1698,6 +1778,35 @@ int loadAppendOnlyFiles(aofManifest *am) {
 
         if (ret == AOF_OPEN_ERR || ret == AOF_FAILED) {
             goto cleanup;
+        }
+    }
+
+    /* Restore the replication ID / offset from the manifest file. */
+    if (am->repl_info &&
+        am->repl_info->repl_offset != -1)
+    {
+        if (!iAmMaster()) {
+            serverLog(LL_NOTICE, "REPL, LOADING the replication ID from the AOF file");
+            memcpy(server.replid,am->repl_info->repl_id,sizeof(server.replid));
+            server.master_repl_offset = am->repl_info->repl_offset;
+            /* If this is a replica, create a cached master from this
+             * information, in order to allow partial resynchronizations
+             * with masters. */
+            replicationCacheMasterUsingMyself();
+            // selectDb(server.cached_master,rsi.repl_stream_db);
+        } else {
+            serverLog(LL_NOTICE, "MASTER, LOADING the replication ID from the AOF file");
+            /* If this is a master, we can save the replication info
+             * as secondary ID and offset, in order to allow replicas
+             * to partial resynchronizations with masters. */
+            memcpy(server.replid2,am->repl_info->repl_id,sizeof(server.replid));
+            server.second_replid_offset = am->repl_info->repl_offset+1;
+            /* Rebase master_repl_offset from rsi.repl_offset. */
+            server.master_repl_offset += am->repl_info->repl_offset;
+            serverAssert(server.repl_backlog);
+            server.repl_backlog->offset = server.master_repl_offset - server.repl_backlog->histlen + 1;
+            rebaseReplicationBuffer(am->repl_info->repl_offset);
+            server.repl_no_slaves_since = time(NULL);
         }
     }
 

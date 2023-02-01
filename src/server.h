@@ -1399,7 +1399,14 @@ typedef struct {
 } aofInfo;
 
 typedef struct {
+    long long last_incr_size;
+    long long repl_offset;
+    char      repl_id[CONFIG_RUN_ID_SIZE+1];
+} aofReplInfo;
+
+typedef struct {
     aofInfo     *base_aof_info;       /* BASE file information. NULL if there is no BASE file. */
+    aofReplInfo *repl_info;       /* Replication information. NULL updated only for graceful shutdown. */
     list        *incr_aof_list;       /* INCR AOFs list. We may have multiple INCR AOF when rewrite fails. */
     list        *history_aof_list;    /* HISTORY AOF list. When the AOFRW success, The aofInfo contained in
                                          `base_aof_info` and `incr_aof_list` will be moved to this list. We
@@ -2727,6 +2734,8 @@ ssize_t aofReadDiffFromParent(void);
 void killAppendOnlyChild(void);
 void restartAOFAfterSYNC();
 void aofLoadManifestFromDisk(void);
+int persistAofManifest(aofManifest *am);
+aofReplInfo *aofReplInfoCreate(void);
 void aofOpenIfNeededOnServerStart(void);
 void aofManifestFree(aofManifest *am);
 int aofDelHistoryFiles(void);

@@ -4201,6 +4201,15 @@ int finishShutdown(void) {
         if (redis_fsync(server.aof_fd) == -1) {
             serverLog(LL_WARNING,"Fail to fsync the AOF file: %s.",
                                  strerror(errno));
+        } else {
+            serverLog(LL_NOTICE,"Persisting replication info for AOF.");
+            serverAssert(server.aof_manifest);
+            server.aof_manifest->repl_info = aofReplInfoCreate();
+            memcpy(server.aof_manifest->repl_info->repl_id, server.replid, sizeof(server.replid));
+            server.aof_manifest->repl_info->repl_offset = server.master_repl_offset;
+            server.aof_manifest->repl_info->last_incr_size = server.aof_last_incr_size;
+            persistAofManifest(server.aof_manifest);
+            //aofReplInfoFree(server.aof_manifest->repl_info);
         }
     }
 
@@ -6518,6 +6527,11 @@ int checkForSentinelMode(int argc, char **argv, char *exec_name) {
 void loadDataFromDisk(void) {
     long long start = ustime();
     if (server.aof_state == AOF_ON) {
+        if (iAmMaster()) {
+            /* Master may delete expired keys when loading, we should
+             * propagate expire to replication backlog. */
+            createReplicationBacklog();
+        }
         int ret = loadAppendOnlyFiles(server.aof_manifest);
         if (ret == AOF_FAILED || ret == AOF_OPEN_ERR)
             exit(1);
